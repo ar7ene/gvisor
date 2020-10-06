@@ -203,7 +203,11 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		// Note that "If CLONE_NEWIPC is set, then create the process in a new IPC
 		// namespace"
 		ipcns = NewIPCNamespace(userns)
+	} else {
+		ipcns.IncRef()
 	}
+	// DecRef in case of failure. If Clone succeeds, take another reference.
+	defer ipcns.DecRef(t)
 
 	netns := t.NetworkNamespace()
 	if opts.NewNetworkNamespace {
@@ -349,6 +353,8 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		ntid.CopyOut(t, opts.ParentTID)
 	}
 
+	// Clone successful; take a reference on the IPC namespace.
+	ipcns.IncRef()
 	kind := ptraceCloneKindClone
 	if opts.Vfork {
 		kind = ptraceCloneKindVfork
