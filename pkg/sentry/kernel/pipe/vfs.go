@@ -235,17 +235,25 @@ func (fd *VFSPipeFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.Syscal
 	return fd.pipe.Ioctl(ctx, uio, args)
 }
 
-// PipeSize implements fcntl(F_GETPIPE_SZ).
-func (fd *VFSPipeFD) PipeSize() int64 {
-	// Inline Pipe.FifoSize() rather than calling it with nil Context and
-	// fs.File and ignoring the returned error (which is always nil).
-	fd.pipe.mu.Lock()
-	defer fd.pipe.mu.Unlock()
-	return fd.pipe.max
+// PipeFcntl extends vfs.FileDescriptionImpl with pipe fcntl() commands.
+type PipeFcntl interface {
+	// PipeSize implements fcntl(F_GETPIPE_SZ).
+	PipeSize(ctx context.Context) (int64, error)
+
+	// SetPipeSize implements fcntl(F_SETPIPE_SZ).
+	SetPipeSize(ctx context.Context, size int64) (int64, error)
 }
 
-// SetPipeSize implements fcntl(F_SETPIPE_SZ).
-func (fd *VFSPipeFD) SetPipeSize(size int64) (int64, error) {
+// PipeSize implements PipeFcntl.PipeSize.
+func (fd *VFSPipeFD) PipeSize(ctx context.Context) (int64, error) {
+	// Inline Pipe.FifoSize() since we don't have a fs.File.
+	fd.pipe.mu.Lock()
+	defer fd.pipe.mu.Unlock()
+	return fd.pipe.max, nil
+}
+
+// SetPipeSize implements PipeFcntl.SetPipeSize.
+func (fd *VFSPipeFD) SetPipeSize(ctx context.Context, size int64) (int64, error) {
 	return fd.pipe.SetFifoSize(size)
 }
 

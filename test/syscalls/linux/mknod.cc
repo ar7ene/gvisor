@@ -96,12 +96,11 @@ TEST(MknodTest, UnimplementedTypesReturnError) {
   const std::string path = NewTempAbsPath();
 
   if (IsRunningWithVFS1()) {
-    ASSERT_THAT(mknod(path.c_str(), S_IFSOCK, 0),
+    EXPECT_THAT(mknod(path.c_str(), S_IFSOCK, 0),
                 SyscallFailsWithErrno(EOPNOTSUPP));
+    EXPECT_THAT(mknod(path.c_str(), S_IFCHR, 0), SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(mknod(path.c_str(), S_IFBLK, 0), SyscallFailsWithErrno(EPERM));
   }
-  // These will fail on linux as well since we don't have CAP_MKNOD.
-  ASSERT_THAT(mknod(path.c_str(), S_IFCHR, 0), SyscallFailsWithErrno(EPERM));
-  ASSERT_THAT(mknod(path.c_str(), S_IFBLK, 0), SyscallFailsWithErrno(EPERM));
 }
 
 TEST(MknodTest, Socket) {

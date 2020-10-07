@@ -15,16 +15,20 @@
 package overlay
 
 import (
+	"fmt"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 func (d *dentry) isSymlink() bool {
@@ -52,6 +56,10 @@ type nonDirectoryFD struct {
 	copiedUp    bool
 	cachedFD    *vfs.FileDescription
 	cachedFlags uint32
+
+	// If copiedUp is is false, lowerWaiters contains all waiter.Entries
+	// registered with cachedFD. lowerWaiters is protected by mu.
+	lowerWaiters map[*waiter.Entry]waiter.EventMask
 }
 
 func (fd *nonDirectoryFD) getCurrentFD(ctx context.Context) (*vfs.FileDescription, error) {
@@ -87,10 +95,21 @@ func (fd *nonDirectoryFD) currentFDLocked(ctx context.Context) (*vfs.FileDescrip
 				return nil, err
 			}
 		}
+		if len(fd.lowerWaiters) != 0 {
+			ready := upperFD.Readiness(^waiter.EventMask(0))
+			for e, mask := range fd.lowerWaiters {
+				fd.cachedFD.EventUnregister(e)
+				upperFD.EventRegister(e, mask)
+				if ready&mask != 0 {
+					e.Callback.Callback(e)
+				}
+			}
+		}
 		fd.cachedFD.DecRef(ctx)
 		fd.copiedUp = true
 		fd.cachedFD = upperFD
 		fd.cachedFlags = statusFlags
+		fd.lowerWaiters = nil
 	} else if fd.cachedFlags != statusFlags {
 		if err := fd.cachedFD.SetStatusFlags(ctx, d.fs.creds, statusFlags); err != nil {
 			return nil, err
@@ -195,6 +214,48 @@ func (fd *nonDirectoryFD) StatFS(ctx context.Context) (linux.Statfs, error) {
 	return fd.filesystem().statFS(ctx)
 }
 
+// Readiness implements waiter.Waitable.Readiness.
+func (fd *nonDirectoryFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	ctx := context.Background()
+	wrappedFD, err := fd.getCurrentFD(ctx)
+	if err != nil {
+		panic(fmt.Sprintf("overlay.nonDirectoryFD.Readiness: currentFDLocked failed: %v", err))
+	}
+	defer wrappedFD.DecRef(ctx)
+	return wrappedFD.Readiness(mask)
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (fd *nonDirectoryFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	wrappedFD, err := fd.currentFDLocked(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("overlay.nonDirectoryFD.EventRegister: currentFDLocked failed: %v", err))
+	}
+	wrappedFD.EventRegister(e, mask)
+	if !fd.copiedUp {
+		if fd.lowerWaiters == nil {
+			fd.lowerWaiters = make(map[*waiter.Entry]waiter.EventMask)
+		}
+		fd.lowerWaiters[e] = mask
+	}
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (fd *nonDirectoryFD) EventUnregister(e *waiter.Entry) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	wrappedFD, err := fd.currentFDLocked(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("overlay.nonDirectoryFD.EventUnregister: currentFDLocked failed: %v", err))
+	}
+	wrappedFD.EventUnregister(e)
+	if !fd.copiedUp {
+		delete(fd.lowerWaiters, e)
+	}
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *nonDirectoryFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	wrappedFD, err := fd.getCurrentFD(ctx)
@@ -267,6 +328,44 @@ func (fd *nonDirectoryFD) Sync(ctx context.Context) error {
 	defer wrappedFD.DecRef(ctx)
 	fd.mu.Unlock()
 	return wrappedFD.Sync(ctx)
+}
+
+// Ioctl implements vfs.FileDescriptionImpl.Ioctl.
+func (fd *nonDirectoryFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	wrappedFD, err := fd.getCurrentFD(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer wrappedFD.DecRef(ctx)
+	return wrappedFD.Ioctl(ctx, uio, args)
+}
+
+// PipeSize implements pipe.PipeFcntl.PipeSize.
+func (fd *nonDirectoryFD) PipeSize(ctx context.Context) (int64, error) {
+	wrappedFD, err := fd.getCurrentFD(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer wrappedFD.DecRef(ctx)
+	wrappedPipeFcntl, ok := wrappedFD.Impl().(pipe.PipeFcntl)
+	if !ok {
+		return 0, syserror.EBADF
+	}
+	return wrappedPipeFcntl.PipeSize(ctx)
+}
+
+// SetPipeSize implements pipe.PipeFcntl.SetPipeSize.
+func (fd *nonDirectoryFD) SetPipeSize(ctx context.Context, size int64) (int64, error) {
+	wrappedFD, err := fd.getCurrentFD(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer wrappedFD.DecRef(ctx)
+	wrappedPipeFcntl, ok := wrappedFD.Impl().(pipe.PipeFcntl)
+	if !ok {
+		return 0, syserror.EBADF
+	}
+	return wrappedPipeFcntl.SetPipeSize(ctx, size)
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
