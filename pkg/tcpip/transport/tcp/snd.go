@@ -1488,7 +1488,6 @@ func (s *sender) sendSegmentFromView(data buffer.VectorisedView, flags byte, seq
 	}
 
 	rcvNxt, rcvWnd := s.ep.rcv.getSendParams()
-
 	// Remember the max sent ack.
 	s.maxSentAck = rcvNxt
 
